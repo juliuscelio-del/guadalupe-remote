@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.PPTRemote" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
