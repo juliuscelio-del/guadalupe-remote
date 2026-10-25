@@ -1,0 +1,118 @@
+name: Build All (Android + Windows + Mac)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  android:
+    name: Android APK (phone remote)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Apply school logo as the app icon
+        run: |
+          pip install pillow
+          python - <<'EOF'
+          import glob, os
+          from PIL import Image
+          res = "app/src/main/res"
+          for f in glob.glob(res + "/mipmap*/ic_launcher*"):
+              os.remove(f)
+          im = Image.open("icon.png").convert("RGBA")
+          for d, s in dict(mdpi=48, hdpi=72, xhdpi=96, xxhdpi=144, xxxhdpi=192).items():
+              os.makedirs(f"{res}/mipmap-{d}", exist_ok=True)
+              im.resize((s, s), Image.LANCZOS).save(f"{res}/mipmap-{d}/ic_launcher.png")
+          print("icons written")
+          # app name shown under the icon on the phone
+          import re
+          for f in glob.glob(res + "/values*/strings.xml"):
+              t = open(f, encoding="utf-8").read()
+              t2 = re.sub(r'(<string\s+name="app_name"[^>]*>)[^<]*(</string>)', r'\1GNHS Remote\2', t)
+              if t2 != t:
+                  open(f, "w", encoding="utf-8").write(t2)
+                  print("app name set in", f)
+          EOF
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - name: Name the APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk GNHS-Remote.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GNHS-Remote-Android
+          path: GNHS-Remote.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows EXE (computer app)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Apply school logo as the app icon
+        shell: bash
+        run: |
+          python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: Build EXE
+        run: >
+          pyinstaller --onefile --windowed
+          --name "GNHS Remote"
+          --icon icon.ico
+          --hidden-import win32com.client
+          --hidden-import pythoncom
+          Remote.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GNHS-Remote-Windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  mac:
+    name: Mac app (computer app, Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies (no pywin32 on Mac)
+        run: |
+          python -m pip install --upgrade pip
+          grep -vi pywin32 requirements.txt > requirements-mac.txt
+          pip install -r requirements-mac.txt pyobjc-core pyobjc-framework-Quartz pyinstaller
+      - name: Apply school logo as the app icon
+        run: |
+          python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').resize((512,512), Image.LANCZOS).save('icon.icns')"
+      - name: Build .app
+        run: |
+          ICON=""
+          [ -f icon.icns ] && ICON="--icon icon.icns"
+          pyinstaller --windowed --noconfirm \
+            --name "GNHS Remote" $ICON \
+            --osx-bundle-identifier ph.deped.gnhs.remote \
+            Remote.py
+      - name: Zip the app
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "GNHS Remote.app" ../GNHS-Remote-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GNHS-Remote-Mac
+          path: GNHS-Remote-Mac.zip
+          if-no-files-found: error
