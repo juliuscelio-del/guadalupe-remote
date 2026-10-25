@@ -1,0 +1,7 @@
+flask
+pyautogui
+mss
+pyperclip
+pillow
+qrcode
+pywin32
