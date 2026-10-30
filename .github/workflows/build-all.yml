@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'README.txt'
 
 jobs:
   android:
@@ -21,7 +24,7 @@ jobs:
       - name: Apply school logo as the app icon
         run: |
           pip install pillow
-          python - <<'EOF'
+          python - <<'PYEOF'
           import glob, os
           from PIL import Image
           res = "app/src/main/res"
@@ -40,11 +43,20 @@ jobs:
               if t2 != t:
                   open(f, "w", encoding="utf-8").write(t2)
                   print("app name set in", f)
-          EOF
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
-      - name: Name the APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk GNHS-Remote.apk
+          PYEOF
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
+      - name: Build signed release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          export VERSION_NAME="1.0.${GITHUB_RUN_NUMBER}"
+          gradle assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk GNHS-Remote.apk
       - uses: actions/upload-artifact@v4
         with:
           name: GNHS-Remote-Android
@@ -116,3 +128,23 @@ jobs:
           name: GNHS-Remote-Mac
           path: GNHS-Remote-Mac.zip
           if-no-files-found: error
+
+  release:
+    needs: [android, windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Tidy file names
+        run: mv "out/GNHS Remote.exe" out/GNHS-Remote-Windows.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: GNHS Remote v1.0.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: out/*
