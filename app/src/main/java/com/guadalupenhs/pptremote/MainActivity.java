@@ -96,6 +96,8 @@ public class MainActivity extends AppCompatActivity {
                 onBack();
             }
         });
+
+        Updater.check(this);
     }
 
     // ------------------------------------------------------------ UI helpers
