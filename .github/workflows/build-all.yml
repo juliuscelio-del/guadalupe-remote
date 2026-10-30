@@ -76,11 +76,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller certifi
       - name: Apply school logo as the app icon
         shell: bash
         run: |
           python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: Stamp version
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import os, re
+          p = "desktop_updater.py"
+          t = open(p, encoding="utf-8").read()
+          v = "1.0." + os.environ["GITHUB_RUN_NUMBER"]
+          t = re.sub(r'(?m)^VERSION = .*$', 'VERSION = "' + v + '"', t)
+          open(p, "w", encoding="utf-8").write(t)
+          print("version", v)
+          PYEOF
       - name: Build EXE
         run: >
           pyinstaller --onefile --windowed
@@ -88,6 +100,8 @@ jobs:
           --icon icon.ico
           --hidden-import win32com.client
           --hidden-import pythoncom
+          --hidden-import desktop_updater
+          --hidden-import certifi
           Remote.py
       - uses: actions/upload-artifact@v4
         with:
@@ -107,10 +121,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           grep -vi pywin32 requirements.txt > requirements-mac.txt
-          pip install -r requirements-mac.txt pyobjc-core pyobjc-framework-Quartz pyinstaller
+          pip install -r requirements-mac.txt pyobjc-core pyobjc-framework-Quartz pyinstaller certifi
       - name: Apply school logo as the app icon
         run: |
           python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').resize((512,512), Image.LANCZOS).save('icon.icns')"
+      - name: Stamp version
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import os, re
+          p = "desktop_updater.py"
+          t = open(p, encoding="utf-8").read()
+          v = "1.0." + os.environ["GITHUB_RUN_NUMBER"]
+          t = re.sub(r'(?m)^VERSION = .*$', 'VERSION = "' + v + '"', t)
+          open(p, "w", encoding="utf-8").write(t)
+          print("version", v)
+          PYEOF
       - name: Build .app
         run: |
           ICON=""
@@ -118,6 +144,7 @@ jobs:
           pyinstaller --windowed --noconfirm \
             --name "GNHS Remote" $ICON \
             --osx-bundle-identifier ph.deped.gnhs.remote \
+            --hidden-import desktop_updater --hidden-import certifi \
             Remote.py
       - name: Zip the app
         run: |
