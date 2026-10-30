@@ -1,12 +1,13 @@
 """
 Auto-updater for the Windows and Mac apps (checks GitHub Releases).
 
-Called from Remote.py at start-up:
-  1. shows "searching for updates" for at least SEARCH_MS
-  2. no update  -> shows "you're up to date" for NO_UPDATE_MS, then the app opens
-  3. update     -> shows "downloading", replaces the app, and restarts it
-  4. offline    -> the app just opens
+Called from Remote.py AFTER the Remote window is already open:
+  1. a small dialog overlaps the Remote window: "searching for updates" (at least SEARCH_MS)
+  2. no update  -> "you're up to date" for NO_UPDATE_MS, then the dialog closes (Remote stays open)
+  3. update     -> "downloading", replaces the app, and restarts it (the Remote window is locked meanwhile)
+  4. offline    -> the dialog just closes
 It does nothing when Remote.py is run from source (only in the built app).
+To preview the look from source (never downloads anything):  GNHS_PREVIEW_UPDATER=1 python3 Remote.py
 """
 import os
 import sys
@@ -156,39 +157,112 @@ def _apply_mac(zip_path):
 
 
 # ------------------------------------------------------------ the dialog
-def check():
-    if not getattr(sys, "frozen", False):
+# vibrant palette (same family as the phone remote)
+C_CARD = "#ffffff"
+C_INK = "#12306b"
+C_TRACK = "#dbe8ff"
+STRIPE = ["#2f6df6", "#4aa3ff", "#1fc76a", "#ffa31a", "#8b5cf6"]
+BAR = {                      # three overlapping pills = soft gradient
+    "search": ("#4aa3ff", "#2f6df6", "#8b5cf6"),
+    "download": ("#ffa31a", "#ff7a3d", "#ff5a5f"),
+    "none": ("#1fc76a", "#1fc76a", "#1fc76a"),
+    "fail": ("#ff5a5f", "#ff5a5f", "#ff5a5f"),
+}
+TEXT = {"search": C_INK, "download": "#d98200", "none": "#139a50", "fail": "#d63a40"}
+
+
+def check(parent):
+    """Show the update dialog ON TOP of the already-open Remote window."""
+    preview = bool(os.environ.get("GNHS_PREVIEW_UPDATER"))   # layout test from source
+    if not getattr(sys, "frozen", False) and not preview:
         return                      # running from source: no updates
-    if not (WIN or MAC):
+    if not (WIN or MAC or preview):
         return
     try:
-        _run()
+        _run(parent, preview)
     except Exception:
         pass
 
 
-def _run():
+def _run(parent, preview=False):
     import tkinter as tk
 
-    BG, INK = "#e4f1ff", "#12306b"
-    root = tk.Tk()
-    root.title("GNHS Remote")
-    root.configure(bg=BG)
-    root.resizable(False, False)
-    lbl = tk.Label(root, text=MSG_SEARCHING, font=("Helvetica", 15, "bold"), fg=INK, bg=BG,
-                   wraplength=380, justify="center", padx=30, pady=40)
-    lbl.pack()
-    root.update_idletasks()
-    w, h = 440, 150
-    root.geometry("%dx%d+%d+%d" % (w, h, (root.winfo_screenwidth() - w) // 2,
-                                   (root.winfo_screenheight() - h) // 3))
-    root.attributes("-topmost", True)
-    root.protocol("WM_DELETE_WINDOW", lambda: None)   # can't be closed while working
+    W, H = 400, 118
+    dlg = tk.Toplevel(parent)
+    dlg.title("GNHS Remote")
+    dlg.configure(bg=C_CARD)
+    dlg.resizable(False, False)
 
-    st = {"stage": "search", "result": None, "dl": None, "path": None, "t0": time.time()}
+    cv = tk.Canvas(dlg, width=W, height=H, bg=C_CARD, highlightthickness=0, bd=0)
+    cv.pack()
+
+    # colorful top stripe
+    seg = W / len(STRIPE)
+    for i, col in enumerate(STRIPE):
+        cv.create_rectangle(i * seg, 0, (i + 1) * seg + 1, 5, fill=col, outline=col)
+
+    msg_id = cv.create_text(W / 2, 48, text=MSG_SEARCHING, width=W - 56, justify="center",
+                            font=("Helvetica", 14, "bold"), fill=TEXT["search"])
+
+    # progress pill
+    BX1, BX2, BY = 28, W - 28, 92
+    cv.create_line(BX1, BY, BX2, BY, width=8, capstyle="round", fill=C_TRACK)
+    bar_ids = [cv.create_line(0, BY, 0, BY, width=8, capstyle="round", fill="#fff") for _ in range(3)]
+
+    # center it over the Remote window
+    parent.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - W) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - H) // 2
+    dlg.geometry("%dx%d+%d+%d" % (W, H, max(x, 0), max(y, 0)))
+    dlg.transient(parent)                         # stays above the Remote window
+    dlg.attributes("-topmost", True)
+    dlg.protocol("WM_DELETE_WINDOW", lambda: None)   # can't be closed while working
+    dlg.lift()
+    try:
+        dlg.wait_visibility()
+        dlg.grab_set()                            # Remote window is locked = forced update
+    except Exception:
+        pass
+
+    st = {"stage": "search", "result": None, "dl": None, "path": None,
+          "t0": time.time(), "pos": 0.0, "dir": 1, "alive": True}
+
+    def set_stage(stage, text):
+        st["stage"] = stage
+        cv.itemconfig(msg_id, text=text, fill=TEXT.get(stage, C_INK))
+        for item, col in zip(bar_ids, BAR.get(stage, BAR["search"])):
+            cv.itemconfig(item, fill=col)
+
+    for item, col in zip(bar_ids, BAR["search"]):
+        cv.itemconfig(item, fill=col)
+
+    def animate():
+        if not st["alive"]:
+            return
+        try:
+            if st["stage"] in ("none", "fail"):
+                # full solid bar
+                for item in bar_ids:
+                    cv.coords(item, BX1, BY, BX2, BY)
+            else:
+                # sliding block that bounces left <-> right
+                span = (BX2 - BX1) - 110
+                st["pos"] += 4.5 * st["dir"]
+                if st["pos"] >= span:
+                    st["pos"], st["dir"] = span, -1
+                elif st["pos"] <= 0:
+                    st["pos"], st["dir"] = 0, 1
+                a = BX1 + st["pos"]
+                b = a + 110
+                cv.coords(bar_ids[0], a, BY, b, BY)
+                cv.coords(bar_ids[1], a + 28, BY, b, BY)
+                cv.coords(bar_ids[2], a + 62, BY, b, BY)
+            dlg.after(16, animate)
+        except Exception:
+            pass
 
     def find():
-        st["result"] = _fetch_latest()
+        st["result"] = ("none",) if preview else _fetch_latest()
 
     def download(url):
         try:
@@ -205,43 +279,51 @@ def _run():
         except Exception:
             st["dl"] = "fail"
 
+    def close():
+        st["alive"] = False
+        try:
+            dlg.grab_release()
+            dlg.destroy()                         # only the dialog; Remote keeps running
+        except Exception:
+            pass
+
     def fail():
-        st["stage"] = "fail"
-        lbl.config(text=MSG_FAILED)
-        root.after(4000, root.destroy)
+        set_stage("fail", MSG_FAILED)
+        dlg.after(4000, close)
 
     def tick():
-        stage = st["stage"]
-        if stage == "search":
-            waited = (time.time() - st["t0"]) * 1000
-            r = st["result"]
-            if r is not None and waited >= SEARCH_MS:
-                if r[0] == "none":
-                    st["stage"] = "none"
-                    lbl.config(text=MSG_NO_UPDATE)
-                    root.after(NO_UPDATE_MS, root.destroy)
+        try:
+            stage = st["stage"]
+            if stage == "search":
+                waited = (time.time() - st["t0"]) * 1000
+                r = st["result"]
+                if r is not None and waited >= SEARCH_MS:
+                    if r[0] == "none":
+                        set_stage("none", MSG_NO_UPDATE)
+                        dlg.after(NO_UPDATE_MS, close)
+                        return
+                    if r[0] == "error":
+                        close()
+                        return
+                    set_stage("download", MSG_DOWNLOADING)
+                    threading.Thread(target=download, args=(r[2],), daemon=True).start()
+            elif stage == "download" and st["dl"] is not None:
+                if st["dl"] != "ok":
+                    fail()
                     return
-                if r[0] == "error":
-                    root.destroy()
+                try:
+                    if WIN:
+                        _apply_windows(st["path"])
+                    else:
+                        _apply_mac(st["path"])
+                except Exception:
+                    fail()
                     return
-                st["stage"] = "download"
-                lbl.config(text=MSG_DOWNLOADING)
-                threading.Thread(target=download, args=(r[2],), daemon=True).start()
-        elif stage == "download" and st["dl"] is not None:
-            if st["dl"] != "ok":
-                fail()
-                return
-            try:
-                if WIN:
-                    _apply_windows(st["path"])
-                else:
-                    _apply_mac(st["path"])
-            except Exception:
-                fail()
-                return
-            os._exit(0)             # the helper script swaps the files and restarts the app
-        root.after(200, tick)
+                os._exit(0)         # the helper script swaps the files and restarts the app
+            dlg.after(200, tick)
+        except Exception:
+            pass                    # Remote window was closed meanwhile
 
     threading.Thread(target=find, daemon=True).start()
-    root.after(200, tick)
-    root.mainloop()
+    animate()
+    dlg.after(200, tick)

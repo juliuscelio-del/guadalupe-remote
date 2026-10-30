@@ -1020,6 +1020,15 @@ def show_window(url):
     stop.bind("<Button-1>", lambda e: root.destroy())
     stop.pack(pady=(16, 22))
     root.protocol("WM_DELETE_WINDOW", root.destroy)
+
+    # The Remote window is built and drawn FIRST. Then the update dialog opens
+    # on top of it (see desktop_updater.py) - it only runs in the built app.
+    root.update()
+    try:
+        import desktop_updater
+        root.after(400, lambda: desktop_updater.check(root))
+    except Exception:
+        pass
     root.mainloop()
 
 
@@ -1035,13 +1044,6 @@ def port_free():
 
 
 if __name__ == "__main__":
-    # Auto-update check (only runs in the built Windows/Mac app, see desktop_updater.py)
-    try:
-        import desktop_updater
-        desktop_updater.check()
-    except Exception:
-        pass
-
     CAPS.update(choose_caps())
     if not port_free():
         msg = f"Port {PORT} is already in use. Is PPT Remote already running?"
