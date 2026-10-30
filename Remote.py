@@ -1035,6 +1035,13 @@ def port_free():
 
 
 if __name__ == "__main__":
+    # Auto-update check (only runs in the built Windows/Mac app, see desktop_updater.py)
+    try:
+        import desktop_updater
+        desktop_updater.check()
+    except Exception:
+        pass
+
     CAPS.update(choose_caps())
     if not port_free():
         msg = f"Port {PORT} is already in use. Is PPT Remote already running?"
