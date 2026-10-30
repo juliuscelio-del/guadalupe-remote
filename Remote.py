@@ -1023,6 +1023,10 @@ def show_window(url):
 
     # The Remote window is built and drawn FIRST. Then the update dialog opens
     # on top of it (see desktop_updater.py) - it only runs in the built app.
+    root.update_idletasks()
+    rw, rh = root.winfo_reqwidth(), root.winfo_reqheight()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry("+%d+%d" % (max((sw - rw) // 2, 0), max((sh - rh) // 2 - 20, 0)))   # centered
     root.update()
     try:
         import desktop_updater

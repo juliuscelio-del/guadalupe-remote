@@ -209,10 +209,10 @@ def _run(parent, preview=False):
     cv.create_line(BX1, BY, BX2, BY, width=8, capstyle="round", fill=C_TRACK)
     bar_ids = [cv.create_line(0, BY, 0, BY, width=8, capstyle="round", fill="#fff") for _ in range(3)]
 
-    # center it over the Remote window
-    parent.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - W) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - H) // 2
+    # center it on the SCREEN (same on Mac and Windows); Remote.py centers its window too
+    dlg.update_idletasks()
+    x = (dlg.winfo_screenwidth() - W) // 2
+    y = (dlg.winfo_screenheight() - H) // 2
     dlg.geometry("%dx%d+%d+%d" % (W, H, max(x, 0), max(y, 0)))
     dlg.transient(parent)                         # stays above the Remote window
     dlg.attributes("-topmost", True)
