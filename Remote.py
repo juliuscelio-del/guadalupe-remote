@@ -9,6 +9,7 @@ Optional: set the STARTING permissions (the phone can change them with checkboxe
   python3 ppt_remote_desktop.py view         watch the desktop only (no control)
   python3 ppt_remote_desktop.py mouse        mouse only (works as a touchpad)
   python3 ppt_remote_desktop.py keys         keyboard only
+  python3 ppt_remote_desktop.py annotate     highlight / circle / zoom on the slide (Windows)
   python3 ppt_remote_desktop.py ppt,view     combine with commas
   python3 ppt_remote_desktop.py all          everything
 (or set RC_ALLOW=ppt,view). With no option, the phone starts with PowerPoint only.
@@ -23,7 +24,7 @@ Mac permissions (System Settings > Privacy & Security), then restart the script:
   - Accessibility      -> turn on Terminal (needed for mouse and keyboard)
   - Screen Recording   -> turn on Terminal (needed for the live screen view)
 """
-import io, os, sys, json, time, socket, secrets, tempfile, threading
+import io, os, re, sys, json, time, socket, secrets, tempfile, threading
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
@@ -77,9 +78,11 @@ DRAG = False
 CAP_INFO = [("ppt", "PowerPoint remote (slides, notes, laser/pen)"),
             ("view", "View the desktop (live screen)"),
             ("mouse", "Control the mouse"),
-            ("keys", "Use the keyboard")]
+            ("keys", "Use the keyboard"),
+            ("annotate", "Annotate slides (highlight, circle, zoom)")]
 ALIASES = {"powerpoint": "ppt", "slides": "ppt", "screen": "view", "desktop": "view",
-           "pointer": "mouse", "keyboard": "keys", "key": "keys", "type": "keys"}
+           "pointer": "mouse", "keyboard": "keys", "key": "keys", "type": "keys",
+           "draw": "annotate", "highlight": "annotate", "zoom": "annotate"}
 CAPS = set()
 MOUSE_ACTIONS = {"moveto", "rel", "click", "dbl", "down", "up", "scroll"}
 KEY_ACTIONS = {"key", "text"}
@@ -110,12 +113,17 @@ def choose_caps():
         caps = parse_caps(arg)
         if caps:
             return caps
-        sys.exit(f"Unknown option: {arg}\nUse any of: ppt, view, mouse, keys, all  (e.g. ppt,view)")
+        sys.exit(f"Unknown option: {arg}\nUse any of: ppt, view, mouse, keys, annotate, all  (e.g. ppt,annotate)")
     return {"ppt"}   # safe default: only the PowerPoint remote
 
 
 def need(cap):
     if cap not in CAPS:
+        abort(Response("not allowed in this mode", status=423))
+
+
+def need_any(*caps):
+    if not CAPS.intersection(caps):
         abort(Response("not allowed in this mode", status=423))
 
 
@@ -264,14 +272,18 @@ DKEYS = {
 }
 
 
-def grab(width, quality):
-    """Screenshot of the primary screen as JPEG bytes, scaled to `width` px wide."""
+def grab_raw():
+    """Full-resolution screenshot of the primary screen (PIL RGB image)."""
     if mss:
         with mss.mss() as sct:
             raw = sct.grab(sct.monitors[1])
-            img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-    else:
-        img = pyautogui.screenshot().convert("RGB")
+            return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+    return pyautogui.screenshot().convert("RGB")
+
+
+def grab(width, quality):
+    """Screenshot of the primary screen as JPEG bytes, scaled to `width` px wide."""
+    img = grab_raw()
     if img.width > width:
         img = img.resize((width, int(img.height * width / img.width)), Image.BILINEAR)
     buf = io.BytesIO()
@@ -344,6 +356,368 @@ def dact(d):
             pyautogui.press("enter")
 
 
+# ------------------------------------------------------------ annotations (highlight / circle / zoom)
+# Marks are kept in "screen fractions" (0..1 of the laptop screen), so they survive zooming.
+# At 1x they are shown by two transparent, click-through, always-on-top windows (Windows).
+# When zoomed, a snapshot of the screen is shown full-screen instead, magnified and re-drawn with the marks.
+HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+ZMAX = 6.0
+HL_ALPHA = 0.5          # highlight strength (same at every zoom level)
+NAV_ACTIONS = {"next", "prev", "first", "last", "goto", "start", "startcur", "end"}
+
+
+def _rgb(c):
+    return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _clamp01(v):
+    return min(max(float(v), 0.0), 1.0)
+
+
+def _ellipse_aa(img, box, color, lw):
+    """Anti-aliased ellipse outline on an RGBA image (drawn on a small 2x tile, then shrunk)."""
+    from PIL import ImageDraw
+    x0, y0, x1, y1 = box
+    m = lw + 2
+    L, T = max(0, int(x0) - m), max(0, int(y0) - m)
+    R, B = min(img.width, int(x1) + m + 1), min(img.height, int(y1) + m + 1)
+    if R <= L or B <= T:
+        return
+    ss = 2
+    tile = Image.new("RGBA", ((R - L) * ss, (B - T) * ss), (0, 0, 0, 0))
+    ImageDraw.Draw(tile).ellipse([(x0 - L) * ss, (y0 - T) * ss, (x1 - L) * ss, (y1 - T) * ss],
+                                 outline=color + (255,), width=lw * ss)
+    tile = tile.resize((R - L, B - T), Image.LANCZOS)
+    img.alpha_composite(tile, (L, T))
+
+
+def compose_view(base, size, z, x0, y0, shapes):
+    """The zoomed picture: crop `base` to the view (x0, y0, 1/z wide), scale to `size`, draw the marks."""
+    W, H = base.size
+    sw, sh = size
+    l, t = x0 * W, y0 * H
+    box = (l, t, min(l + W / z, W), min(t + H / z, H))
+    view = base.resize((sw, sh), Image.BILINEAR, box=box).convert("RGB")
+
+    def px(s):
+        return ((s["x0"] - x0) * z * sw, (s["y0"] - y0) * z * sh,
+                (s["x1"] - x0) * z * sw, (s["y1"] - y0) * z * sh)
+
+    for s in shapes:
+        if s["kind"] != "hl":
+            continue
+        L, T, R, B = [int(round(v)) for v in px(s)]
+        L, T, R, B = max(L, 0), max(T, 0), min(R, sw), min(B, sh)
+        if R > L and B > T:
+            region = view.crop((L, T, R, B))
+            tint = Image.new("RGB", region.size, _rgb(s["color"]))
+            view.paste(Image.blend(region, tint, HL_ALPHA), (L, T))
+    circles = [s for s in shapes if s["kind"] == "circle"]
+    if circles:
+        ink = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        lw = max(4, round(sw / 320))
+        for s in circles:
+            _ellipse_aa(ink, px(s), _rgb(s["color"]), lw)
+        view = Image.alpha_composite(view.convert("RGBA"), ink).convert("RGB")
+    return view
+
+
+class _Layer:
+    """A transparent, click-through, always-on-top full-screen window (Windows)."""
+    KEY = "#010203"      # this exact colour is see-through
+
+    def __init__(self, root, alpha):
+        import tkinter as tk
+        self.sw, self.sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w = tk.Toplevel(root)
+        w.withdraw()
+        w.overrideredirect(True)
+        w.geometry("%dx%d+0+0" % (self.sw, self.sh))
+        w.configure(bg=self.KEY)
+        w.attributes("-topmost", True)
+        w.attributes("-transparentcolor", self.KEY)
+        w.attributes("-alpha", alpha)
+        self.canvas = tk.Canvas(w, width=self.sw, height=self.sh, bg=self.KEY,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.win = w
+        self.shown = False
+        self.passthru = False
+
+    def _clickthrough(self):
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.GetParent.argtypes, u.GetParent.restype = [wintypes.HWND], wintypes.HWND
+        u.GetWindowLongW.argtypes, u.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
+        u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+        wid = self.win.winfo_id()
+        hwnd = u.GetParent(wid) or wid
+        # layered + transparent (mouse passes through) + tool window + never takes focus
+        style = u.GetWindowLongW(hwnd, -20)
+        u.SetWindowLongW(hwnd, -20, style | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
+        self.passthru = True
+
+    def show(self):
+        if not self.shown:
+            self.win.deiconify()
+            self.win.update_idletasks()
+            self.shown = True
+        if not self.passthru:
+            self._clickthrough()
+        self.raise_()
+
+    def raise_(self):
+        self.win.attributes("-topmost", True)
+        self.win.lift()
+
+    def hide(self):
+        if self.shown:
+            self.win.withdraw()
+            self.shown = False
+
+
+class Annotator:
+    """Highlights and circles drawn over the slide show, plus zoom. Thread-safe state; Tk only on the main thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.shapes = []
+        self.next_id = 1
+        self.z, self.x0, self.y0 = 1.0, 0.0, 0.0
+        self.dirty = False
+        self.ready = False
+        self.err = "Starting… (the Remote window must be open)"
+        self.slide = None
+        self.root = None
+        self.hl = self.ink = self.zwin = self.zlabel = None
+        self.base = None
+        self._n = 0
+
+    # ---------- called from the web server threads
+    def state(self):
+        with self.lock:
+            return self._state()
+
+    def _state(self):
+        return {"ok": True, "z": round(self.z, 2), "count": len(self.shapes),
+                "ready": self.ready, "err": self.err if not self.ready else ""}
+
+    def _w(self, fx, fy):
+        """view fraction (what the phone shows) -> screen fraction"""
+        return (_clamp01(self.x0 + _clamp01(fx) / self.z), _clamp01(self.y0 + _clamp01(fy) / self.z))
+
+    def _fit_view(self):
+        if self.z <= 1.001:
+            self.z, self.x0, self.y0 = 1.0, 0.0, 0.0
+            return
+        span = 1.0 / self.z
+        self.x0 = min(max(self.x0, 0.0), 1.0 - span)
+        self.y0 = min(max(self.y0, 0.0), 1.0 - span)
+
+    def _add(self, d):
+        kind = d.get("kind")
+        color = d.get("color", "#ffe600")
+        if kind not in ("hl", "circle") or not HEX.match(color):
+            raise ValueError("bad shape")
+        ax, ay = self._w(float(d["x0"]), float(d["y0"]))
+        bx, by = self._w(float(d["x1"]), float(d["y1"]))
+        x0, x1, y0, y1 = min(ax, bx), max(ax, bx), min(ay, by), max(ay, by)
+        if x1 - x0 < 0.004 or y1 - y0 < 0.004:
+            return
+        if len(self.shapes) >= 200:
+            self.shapes.pop(0)
+        self.shapes.append({"id": self.next_id, "kind": kind, "color": color,
+                            "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+        self.next_id += 1
+
+    @staticmethod
+    def _hit(s, x, y):
+        pad = 0.006
+        if s["kind"] == "hl":
+            return s["x0"] - pad <= x <= s["x1"] + pad and s["y0"] - pad <= y <= s["y1"] + pad
+        a = (s["x1"] - s["x0"]) / 2 + pad
+        b = (s["y1"] - s["y0"]) / 2 + pad
+        cx, cy = (s["x0"] + s["x1"]) / 2, (s["y0"] + s["y1"]) / 2
+        return ((x - cx) / a) ** 2 + ((y - cy) / b) ** 2 <= 1.0
+
+    def _remove_at(self, d):
+        x, y = self._w(float(d["fx"]), float(d["fy"]))
+        for i in range(len(self.shapes) - 1, -1, -1):     # newest on top
+            if self._hit(self.shapes[i], x, y):
+                del self.shapes[i]
+                return
+
+    def _zoompan(self, d):
+        f = min(max(float(d.get("f", 1)), 0.2), 5.0)
+        fx, fy = _clamp01(d.get("fx", 0.5)), _clamp01(d.get("fy", 0.5))
+        dx, dy = float(d.get("dx", 0)), float(d.get("dy", 0))
+        wx, wy = self.x0 + fx / self.z, self.y0 + fy / self.z      # screen point under the fingers
+        nz = min(max(self.z * f, 1.0), ZMAX)
+        self.x0, self.y0 = wx - fx / nz - dx / nz, wy - fy / nz - dy / nz   # keep it there, then drag
+        self.z = nz
+        self._fit_view()
+
+    def handle(self, d):
+        a = d.get("a")
+        with self.lock:
+            if a == "add":
+                self._add(d)
+            elif a == "remove_at":
+                self._remove_at(d)
+            elif a == "undo":
+                if self.shapes:
+                    self.shapes.pop()
+            elif a == "clear":
+                self.shapes.clear()
+            elif a == "zp":
+                self._zoompan(d)
+            elif a == "reset":
+                self.z, self.x0, self.y0 = 1.0, 0.0, 0.0
+            elif a == "wipe":
+                self.shapes.clear()
+                self.z, self.x0, self.y0 = 1.0, 0.0, 0.0
+            else:
+                raise ValueError("unknown action")
+            self.dirty = True
+            return self._state()
+
+    def wipe(self):
+        """New slide: drop every mark and zoom back out."""
+        with self.lock:
+            busy = bool(self.shapes) or self.z > 1.0
+        if busy:
+            self.handle({"a": "wipe"})
+
+    # ---------- main (Tk) thread
+    def attach(self, root):
+        self.root = root
+        if sys.platform != "win32":
+            self.err = "Highlight / circle / zoom works on Windows only for now."
+            print("  Annotate:       " + self.err)
+            return
+        self.ready = True
+        self.err = ""
+        root.after(80, self._tick)
+
+    def _tick(self):
+        try:
+            with self.lock:
+                go = self.dirty
+                self.dirty = False
+                snap = (self.z, self.x0, self.y0, [dict(s) for s in self.shapes]) if go else None
+            if go:
+                self._render(*snap)
+            self._n += 1
+            if self._n % 25 == 0:
+                self._keep_on_top()
+        except Exception as e:
+            print("annotate error:", e)
+        try:
+            self.root.after(40, self._tick)
+        except Exception:
+            pass    # window closed
+
+    def _keep_on_top(self):
+        if self.zwin is not None and self.zwin_shown:
+            self.zwin.lift()
+        else:
+            for lay in (self.hl, self.ink):
+                if lay is not None and lay.shown:
+                    lay.raise_()
+
+    zwin_shown = False
+
+    def _render(self, z, x0, y0, shapes):
+        if z <= 1.001:
+            self._hide_zoom()
+            self.base = None
+            self._draw_layers(shapes)
+        else:
+            if self.base is None:
+                self._snapshot()
+            self._show_zoom(z, x0, y0, shapes)
+
+    def _hide_layers(self):
+        for lay in (self.hl, self.ink):
+            if lay is not None:
+                lay.hide()
+
+    def _hide_zoom(self):
+        if self.zwin is not None and self.zwin_shown:
+            self.zwin.withdraw()
+            self.zwin_shown = False
+
+    def _snapshot(self):
+        """Grab the screen without our own windows on it."""
+        self._hide_layers()
+        self._hide_zoom()
+        self.root.update()
+        time.sleep(0.15)
+        with SLOCK:
+            self.base = grab_raw()
+
+    def _draw_layers(self, shapes):
+        if self.hl is None:
+            self.hl = _Layer(self.root, HL_ALPHA)
+            self.ink = _Layer(self.root, 0.92)
+        sw, sh = self.hl.sw, self.hl.sh
+        self.hl.canvas.delete("all")
+        self.ink.canvas.delete("all")
+        lw = max(4, round(sw / 320))
+        nh = ni = 0
+        for s in shapes:
+            x0, y0, x1, y1 = s["x0"] * sw, s["y0"] * sh, s["x1"] * sw, s["y1"] * sh
+            if s["kind"] == "hl":
+                self.hl.canvas.create_rectangle(x0, y0, x1, y1, fill=s["color"], outline="")
+                nh += 1
+            else:
+                self.ink.canvas.create_oval(x0, y0, x1, y1, outline=s["color"], width=lw)
+                ni += 1
+        if nh:
+            self.hl.show()
+        else:
+            self.hl.hide()
+        if ni:
+            self.ink.show()
+        else:
+            self.ink.hide()
+
+    def _show_zoom(self, z, x0, y0, shapes):
+        import tkinter as tk
+        from PIL import ImageTk
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if self.zwin is None:
+            w = tk.Toplevel(self.root)
+            w.withdraw()
+            w.overrideredirect(True)
+            w.geometry("%dx%d+0+0" % (sw, sh))
+            w.configure(bg="black")
+            w.attributes("-topmost", True)
+            self.zlabel = tk.Label(w, bd=0, highlightthickness=0, bg="black")
+            self.zlabel.place(x=0, y=0, width=sw, height=sh)
+            for ev in ("<Button-1>", "<Button-3>"):      # a tap on the laptop also zooms back out
+                self.zlabel.bind(ev, self._ui_restore)
+            self.zwin = w
+        photo = ImageTk.PhotoImage(compose_view(self.base, (sw, sh), z, x0, y0, shapes))
+        self.zlabel.configure(image=photo)
+        self.zlabel.image = photo
+        if not self.zwin_shown:
+            self.zwin.deiconify()
+            self.zwin_shown = True
+        self.zwin.attributes("-topmost", True)
+        self.zwin.lift()
+        self._hide_layers()
+
+    def _ui_restore(self, _event=None):
+        self.handle({"a": "reset"})
+
+
+ANN = Annotator()
+
+
 # ------------------------------------------------------------ web
 THEME = r"""
 :root{--bg1:#e4f1ff;--bg2:#fff3d1;--ink:#12306b;--muted:#5f78a8;--line:#c6dbff;
@@ -365,6 +739,7 @@ button.on{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:
 button.go{background:var(--green);border-color:var(--green);color:#fff;box-shadow:0 3px 0 #139a50}
 button.stop{background:var(--red);border-color:var(--red);color:#fff;box-shadow:0 3px 0 #d63a40}
 button.purple{background:var(--purple);border-color:var(--purple);color:#fff;box-shadow:0 3px 0 #6d3fd1}
+button.orange{background:var(--orange);border-color:var(--orange);color:#fff;box-shadow:0 3px 0 #d98200}
 """
 
 BRAND = ('<div class=brand><img src="/logo.png" alt="" onerror="this.style.display=\'none\'">'
@@ -428,6 +803,7 @@ button.big.prev{background:#fff;color:var(--blue);border-color:var(--blue);box-s
 <div id=info><span id=pos>– / –</span><span id=tmr onclick="t0=null">00:00</span></div>
 <div id=msg></div>
 <div class=row id=deskrow><button class=purple onclick="location='/desktop'">🖥 Desktop control</button></div>
+<div class=row id=annrow><button class=orange onclick="location='/annotate'">✏ Highlight · Circle · Zoom</button></div>
 <div class=thumbs>
  <div>Now<img id=t1></div><div>Next<img id=t2></div>
 </div>
@@ -464,6 +840,7 @@ const api=o=>fetch('/api',{method:'POST',headers:{'Content-Type':'application/js
   body:JSON.stringify(o)}).catch(()=>{});
 const CAPS=__CAPS__;
 if(!(CAPS.view||CAPS.mouse||CAPS.keys)) $('deskrow').style.display='none';
+if(!CAPS.annotate) $('annrow').style.display='none';
 let tool='laser', t0=null, last={cur:-1};
 try{navigator.wakeLock&&navigator.wakeLock.request('screen');}catch(e){}
 document.addEventListener('click',()=>{try{navigator.wakeLock&&navigator.wakeLock.request('screen');}catch(e){}});
@@ -756,6 +1133,215 @@ wrap.addEventListener('touchcancel',e=>{
 """
 
 
+ANNOTATE = r"""<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>__SCHOOL__ - Annotate</title>
+<link rel=icon href=/logo.png>
+<style>
+__THEME__
+html,body{height:100%}
+body{display:flex;flex-direction:column;gap:6px;padding:6px;height:100dvh}
+.row{display:flex;gap:6px}
+.row>*{flex:1;min-width:0}
+button{font-size:.95rem;padding:.55rem .3rem}
+#view{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#dbe8ff;
+ border-radius:12px;overflow:hidden;border:2px solid #fff;box-shadow:0 2px 10px rgba(47,109,246,.25)}
+#wrap{position:relative;line-height:0;touch-action:none}
+#scr{display:block;width:100%;height:100%;pointer-events:none}
+#pv{position:absolute;display:none;pointer-events:none;box-sizing:border-box}
+#msg{color:#d98200;font-size:.78rem;min-height:1em;font-weight:600;display:flex;justify-content:space-between;gap:8px}
+#zl{color:var(--blue);font-weight:800}
+#sw button{height:2.1rem;border-radius:50%;padding:0;border:3px solid #fff;box-shadow:0 0 0 2px var(--line)}
+#sw button.sel{box-shadow:0 0 0 3px var(--ink)}
+</style>
+<div class=row style="align-items:center">
+ <div class="brand small" style="flex:1"><img src="/logo.png" alt="" onerror="this.style.display='none'"><b>__SCHOOL__</b></div>
+ <button id=back style="flex:0 0 auto;padding:.5rem .8rem" onclick="location='/'">◀ Remote</button>
+ <button style="flex:0 0 auto;padding:.5rem .8rem" onclick="location='/settings'">⚙</button>
+</div>
+<div id=msg><span id=txt>Pick a tool, then drag on the slide. Pinch to zoom.</span><span><span id=cnt></span> <span id=zl>1×</span></span></div>
+<div id=view><div id=wrap><img id=scr alt=""><div id=pv></div></div></div>
+<div class=row id=tools>
+ <button data-tool=hl class=on>🖍 Highlight</button>
+ <button data-tool=circle>⭕ Circle</button>
+ <button data-tool=erase>🧽 Remove</button>
+ <button data-tool=move>✋ Move</button>
+</div>
+<div class=row id=sw></div>
+<div class=row>
+ <button id=zout>🔍−  Zoom out</button>
+ <button id=zreset>Restore</button>
+ <button id=zin>🔍+  Zoom in</button>
+</div>
+<div class=row>
+ <button id=undo>↩ Undo last</button>
+ <button id=clear class=stop>Clear all marks</button>
+</div>
+<div class=row id=nav>
+ <button class="big prev" style="padding:.7rem 0;background:#fff;color:var(--blue);border-color:var(--blue)" onclick="nav('prev')">◀ PREV</button>
+ <button class=on style="padding:.7rem 0" onclick="nav('next')">NEXT ▶</button>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const wrap=$('wrap'), img=$('scr'), view=$('view'), pv=$('pv');
+const CAPS=__CAPS__;
+if(!CAPS.ppt){ $('back').style.display='none'; $('nav').style.display='none'; }
+const PAL={hl:['#ffe600','#7dff6b','#ff69b4','#ffa500','#4dd8ff','#c58bff'],
+           circle:['#ff3b30','#1e6bff','#10b13a','#ff8a00','#d62cff','#000000']};
+const col={hl:PAL.hl[0], circle:PAL.circle[0]};
+let tool='hl';
+const clamp=v=>Math.min(1,Math.max(0,v));
+
+/* ---- ordered requests ---- */
+let chain=Promise.resolve();
+const api=o=>(chain=chain.then(()=>send(o)));
+async function send(o){
+  try{
+    const r=await fetch('/aapi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+    if(r.status===403){location='/login';return;}
+    if(!r.ok){ $('txt').textContent=(await r.text())||'Something went wrong'; return; }
+    show(await r.json());
+  }catch(e){}
+}
+function show(s){
+  $('zl').textContent=(s.z>1.01?s.z.toFixed(1):'1')+'×';
+  $('cnt').textContent=s.count?(s.count+(s.count===1?' mark':' marks')):'';
+  if(!s.ready) $('txt').textContent=s.err||'Not ready';
+}
+function nav(a){
+  fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:a})}).catch(()=>{});
+}
+
+/* ---- live screen ---- */
+function fit(){
+  const ar=img.naturalWidth?img.naturalWidth/img.naturalHeight:0; if(!ar) return;
+  let w=view.clientWidth, h=w/ar;
+  if(h>view.clientHeight){h=view.clientHeight; w=h*ar;}
+  wrap.style.width=w+'px'; wrap.style.height=h+'px';
+}
+img.addEventListener('load',fit); window.addEventListener('resize',fit);
+if(window.ResizeObserver) new ResizeObserver(fit).observe(view);
+async function frame(){
+  if(document.hidden){setTimeout(frame,500);return;}
+  try{
+    const r=await fetch('/screen?w=1000&q=60&t='+Date.now());
+    if(r.status===403){location='/login';return;}
+    if(!r.ok){ $('txt').textContent='Screen capture failed. Check Screen Recording permission.'; setTimeout(frame,1500); return; }
+    const url=URL.createObjectURL(await r.blob());
+    const old=img.src; img.src=url;
+    if(old.startsWith('blob:')) URL.revokeObjectURL(old);
+  }catch(e){ await new Promise(r=>setTimeout(r,500)); }
+  setTimeout(frame,40);
+}
+frame();
+async function poll(){
+  try{
+    const r=await fetch('/astatus');
+    if(r.status===403){location='/login';return;}
+    if(r.ok) show(await r.json());
+  }catch(e){}
+  setTimeout(poll,800);
+}
+poll();
+
+/* ---- tools and colours ---- */
+function drawSw(){
+  const t=(tool==='hl'||tool==='circle')?tool:null, sw=$('sw');
+  sw.style.display=t?'flex':'none'; if(!t) return;
+  sw.innerHTML='';
+  PAL[t].forEach(c=>{
+    const b=document.createElement('button'); b.style.background=c;
+    if(c===col[t]) b.className='sel';
+    b.onclick=()=>{ col[t]=c; drawSw(); };
+    sw.appendChild(b);
+  });
+}
+drawSw();
+$('tools').addEventListener('click',e=>{
+  const b=e.target.closest('[data-tool]'); if(!b) return;
+  tool=b.dataset.tool;
+  document.querySelectorAll('[data-tool]').forEach(x=>x.classList.toggle('on',x===b));
+  drawSw();
+});
+$('zin').onclick=()=>api({a:'zp',f:1.5,fx:.5,fy:.5});
+$('zout').onclick=()=>api({a:'zp',f:1/1.5,fx:.5,fy:.5});
+$('zreset').onclick=()=>api({a:'reset'});
+$('undo').onclick=()=>api({a:'undo'});
+$('clear').onclick=()=>api({a:'clear'});
+
+/* ---- zoom / pan (batched) ---- */
+let acc={f:1,dx:0,dy:0,fx:.5,fy:.5}, timer=null;
+function queueZP(f,fx,fy,dx,dy){
+  acc.f*=f; acc.dx+=dx; acc.dy+=dy; acc.fx=fx; acc.fy=fy;
+  if(!timer) timer=setTimeout(flushZ,90);
+}
+function flushZ(){
+  if(timer){clearTimeout(timer);timer=null;}
+  if(acc.f===1&&!acc.dx&&!acc.dy) return;
+  const o=Object.assign({a:'zp'},acc); acc={f:1,dx:0,dy:0,fx:.5,fy:.5}; api(o);
+}
+
+/* ---- touch ---- */
+function fr(t){
+  const r=wrap.getBoundingClientRect();
+  return {x:clamp((t.clientX-r.left)/r.width), y:clamp((t.clientY-r.top)/r.height)};
+}
+let st=null, g=null, pvTimer=null;
+function hidePv(){ pv.style.display='none'; }
+function drawPv(){
+  const x=Math.min(st.x0,st.x1), y=Math.min(st.y0,st.y1), w=Math.abs(st.x1-st.x0), h=Math.abs(st.y1-st.y0);
+  pv.style.cssText='position:absolute;display:block;pointer-events:none;box-sizing:border-box;left:'+x*100+'%;top:'+y*100+'%;width:'+w*100+'%;height:'+h*100+'%;'
+    +(tool==='hl'?'background:'+col.hl+';opacity:.5':'border:4px solid '+col.circle+';border-radius:50%');
+}
+function mid(e){ const a=fr(e.touches[0]), b=fr(e.touches[1]); return {x:(a.x+b.x)/2,y:(a.y+b.y)/2}; }
+function dist(e){ return Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY)||1; }
+
+wrap.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  if(e.touches.length>=2){ st=null; hidePv(); g={d:dist(e),m:mid(e)}; return; }
+  if(g) return;                       // a finger left a pinch; wait until all are up
+  clearTimeout(pvTimer); hidePv();
+  const p=fr(e.touches[0]);
+  st={x0:p.x,y0:p.y,x1:p.x,y1:p.y,moved:false};
+},{passive:false});
+
+wrap.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  if(g){
+    if(e.touches.length>=2){ const d=dist(e), m=mid(e);
+      queueZP(d/g.d,m.x,m.y,m.x-g.m.x,m.y-g.m.y); g.d=d; g.m=m; }
+    return;
+  }
+  if(!st) return;
+  const p=fr(e.touches[0]), px=st.x1, py=st.y1;
+  st.x1=p.x; st.y1=p.y;
+  if(Math.hypot(p.x-st.x0,p.y-st.y0)>0.012) st.moved=true;
+  if(tool==='hl'||tool==='circle'){ if(st.moved) drawPv(); }
+  else if(tool==='move'){ queueZP(1,.5,.5,p.x-px,p.y-py); }
+},{passive:false});
+
+function finish(e,cancel){
+  e.preventDefault();
+  if(g){ if(e.touches.length===0){ flushZ(); g=null; } return; }
+  if(!st) return;
+  const s=st; st=null;
+  if(cancel){ hidePv(); return; }
+  if(tool==='hl'||tool==='circle'){
+    if(s.moved){
+      api({a:'add',kind:tool,color:col[tool],x0:s.x0,y0:s.y0,x1:s.x1,y1:s.y1});
+      pvTimer=setTimeout(hidePv,450);   // keep the preview until the laptop's screen catches up
+    }else hidePv();
+  }else if(tool==='erase'){
+    if(!s.moved) api({a:'remove_at',fx:s.x0,fy:s.y0});
+  }else if(tool==='move'){ flushZ(); }
+}
+wrap.addEventListener('touchend',e=>finish(e,false),{passive:false});
+wrap.addEventListener('touchcancel',e=>finish(e,true),{passive:false});
+</script>
+"""
+
+
 SETTINGS = r"""<!doctype html>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no">
@@ -780,6 +1366,7 @@ __BRAND__
 <label class=opt style="--c:var(--green)"><input type=checkbox id=view><span class=ic>🖥</span><span>View the desktop<small>Live screen, watch only</small></span></label>
 <label class=opt style="--c:var(--orange)"><input type=checkbox id=mouse><span class=ic>🖱</span><span>Control the mouse<small>Tap, drag, scroll, right-click</small></span></label>
 <label class=opt style="--c:var(--purple)"><input type=checkbox id=keys><span class=ic>⌨</span><span>Use the keyboard<small>Type text and press keys</small></span></label>
+<label class=opt style="--c:var(--red)"><input type=checkbox id=annotate><span class=ic>✏</span><span>Annotate slides<small>Highlight, circle, zoom (shows the screen on the phone)</small></span></label>
 <div class=warn>Only turn on what you need. Anyone with the PIN can change these.</div>
 <button class=go onclick="go()">Continue</button>
 <script>
@@ -845,8 +1432,19 @@ def home():
     if not authed():
         return redirect("/login")
     if "ppt" not in CAPS:
+        if "annotate" in CAPS:
+            return redirect("/annotate")
         return redirect("/desktop" if CAPS else "/settings")
     return page(PAGE)
+
+
+@app.route("/annotate")
+def annotate_page():
+    if not authed():
+        return redirect("/login")
+    if "annotate" not in CAPS:
+        return redirect("/")
+    return page(ANNOTATE)
 
 
 @app.route("/desktop")
@@ -863,8 +1461,12 @@ def api():
     if not authed():
         abort(403)
     need("ppt")
+    d = request.get_json(force=True)
     with LOCK:
-        act(request.get_json(force=True))
+        act(d)
+    if d.get("a") in NAV_ACTIONS:      # new slide: marks and zoom belong to the old one
+        ANN.wipe()
+        ANN.slide = None
     return "ok"
 
 
@@ -888,11 +1490,44 @@ def dapi():
     return "ok"
 
 
+@app.route("/aapi", methods=["POST"])
+def aapi():
+    if not authed():
+        abort(403)
+    need("annotate")
+    if not ANN.ready:
+        abort(Response(ANN.err or "Annotation is not ready yet", status=503))
+    try:
+        return jsonify(ANN.handle(request.get_json(force=True)))
+    except (KeyError, ValueError, TypeError):
+        abort(400)
+
+
+@app.route("/astatus")
+def astatus_route():
+    if not authed():
+        abort(403)
+    need("annotate")
+    out = ANN.state()
+    if ANN.ready and "ppt" in CAPS:
+        with LOCK:
+            s = status()
+        if s["running"]:
+            if ANN.slide is not None and s["cur"] != ANN.slide:   # slide changed on the laptop itself
+                ANN.wipe()
+            ANN.slide = s["cur"]
+            out = ANN.state()
+        else:
+            ANN.slide = None
+        out.update(cur=s["cur"], total=s["total"], running=s["running"])
+    return jsonify(out)
+
+
 @app.route("/screen")
 def screen_route():
     if not authed():
         abort(403)
-    need("view")
+    need_any("view", "annotate")
     try:
         w = max(300, min(int(request.args.get("w", 1000)), 2400))
         q = max(20, min(int(request.args.get("q", 55)), 90))
@@ -1028,6 +1663,7 @@ def show_window(url):
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry("+%d+%d" % (max((sw - rw) // 2, 0), max((sh - rh) // 2 - 20, 0)))   # centered
     root.update()
+    ANN.attach(root)                  # highlight / circle / zoom overlay (runs on this window's loop)
     try:
         import desktop_updater
         root.after(400, lambda: desktop_updater.check(root))

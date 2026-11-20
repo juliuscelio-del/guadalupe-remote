@@ -18,3 +18,19 @@ USE THE APP
 5. Type the PIN shown in the window.
 6. Tick what the phone may do and tap Continue, then tap Start.
 7. Click Stop when finished. A new PIN is made every time the app starts.
+
+HIGHLIGHT, CIRCLE AND ZOOM (new, Windows)
+1. On the phone's permissions page, tick "Annotate slides" and tap Continue.
+   (It shows the laptop screen on the phone so you can point at the text.)
+2. On the main page tap "Highlight - Circle - Zoom".
+3. Pick a tool, pick a colour, then drag on the slide picture:
+   - Highlight : drag a box over the text.
+   - Circle    : drag a box; a circle is drawn inside it.
+   - Remove    : tap a highlight or circle to remove just that one.
+   - Move      : drag to pan while zoomed.
+   Zoom: pinch with two fingers, or use Zoom in / Zoom out / Restore.
+   Undo last removes the newest mark. Clear all removes every mark.
+4. Marks and zoom are cleared automatically when the slide changes.
+Notes: while zoomed, the slide is a still picture (animations and video pause);
+tap Restore to go back to the live slide. Tapping the laptop screen also restores.
+
