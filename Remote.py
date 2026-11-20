@@ -436,6 +436,48 @@ def compose_view(base, size, z, x0, y0, shapes):
     return view
 
 
+_U32 = None
+
+
+def _u32():
+    """user32 with correct 64-bit handle types (Windows only)."""
+    global _U32
+    if _U32 is None:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetParent.argtypes, u.GetParent.restype = [wintypes.HWND], wintypes.HWND
+        u.GetForegroundWindow.argtypes, u.GetForegroundWindow.restype = [], wintypes.HWND
+        u.SetForegroundWindow.argtypes, u.SetForegroundWindow.restype = [wintypes.HWND], wintypes.BOOL
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.SetWindowPos.restype = wintypes.BOOL
+        _U32 = u
+    return _U32
+
+
+def _top_hwnd(win):
+    """The real top-level window handle of a Tk Toplevel (Windows)."""
+    u = _u32()
+    wid = win.winfo_id()
+    return u.GetParent(wid) or wid
+
+
+def raise_topmost(win):
+    """Put a Tk window above EVERY always-on-top window, without taking focus.
+    PowerPoint's slide show window is itself always-on-top and pushes itself in front of other
+    topmost windows, so Tk's own -topmost/lift() is not enough while a show is running."""
+    if sys.platform != "win32":
+        return
+    try:
+        # HWND_TOPMOST (-1); SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+        _u32().SetWindowPos(_top_hwnd(win), -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+    except Exception as e:
+        if not getattr(raise_topmost, "_warned", False):
+            raise_topmost._warned = True
+            print("annotate: could not raise the overlay above the slide show:", e)
+
+
 class _Layer:
     """A transparent, click-through, always-on-top full-screen window (Windows)."""
     KEY = "#010203"      # this exact colour is see-through
@@ -475,17 +517,31 @@ class _Layer:
         self.passthru = True
 
     def show(self):
-        if not self.shown:
+        first = not self.shown
+        prev = None
+        if first:
+            if sys.platform == "win32":
+                try:
+                    prev = _u32().GetForegroundWindow()     # normally the slide show
+                except Exception:
+                    prev = None
             self.win.deiconify()
             self.win.update_idletasks()
             self.shown = True
         if not self.passthru:
             self._clickthrough()
         self.raise_()
+        if first and prev:      # showing the overlay must not take the keyboard away from the slide show
+            try:
+                if prev != _top_hwnd(self.win):
+                    _u32().SetForegroundWindow(prev)
+            except Exception:
+                pass
 
     def raise_(self):
         self.win.attributes("-topmost", True)
         self.win.lift()
+        raise_topmost(self.win)
 
     def hide(self):
         if self.shown:
@@ -627,7 +683,7 @@ class Annotator:
             if go:
                 self._render(*snap)
             self._n += 1
-            if self._n % 25 == 0:
+            if self._n % 5 == 0:        # ~5x a second: PowerPoint pushes its show back in front
                 self._keep_on_top()
         except Exception as e:
             print("annotate error:", e)
@@ -639,6 +695,7 @@ class Annotator:
     def _keep_on_top(self):
         if self.zwin is not None and self.zwin_shown:
             self.zwin.lift()
+            raise_topmost(self.zwin)
         else:
             for lay in (self.hl, self.ink):
                 if lay is not None and lay.shown:
@@ -727,6 +784,7 @@ class Annotator:
             self.zwin_shown = True
         self.zwin.attributes("-topmost", True)
         self.zwin.lift()
+        raise_topmost(self.zwin)
         if sys.platform == "darwin":
             self._mac_float()
         self._hide_layers()
