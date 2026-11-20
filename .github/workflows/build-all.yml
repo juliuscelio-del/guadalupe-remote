@@ -112,6 +112,7 @@ jobs:
   mac:
     name: Mac app (computer app, Apple Silicon)
     runs-on: macos-14
+    continue-on-error: true      # optional: if this runner is unavailable, Android + Windows still release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -158,6 +159,7 @@ jobs:
 
   release:
     needs: [android, windows, mac]
+    if: ${{ !cancelled() && needs.android.result == 'success' && needs.windows.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
