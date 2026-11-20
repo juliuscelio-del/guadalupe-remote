@@ -683,6 +683,15 @@ class Annotator:
             return
         self.ready = True
         self.err = ""
+        if sys.platform == "darwin":
+            def _reopen(*_):
+                self.root_hidden = False
+                root.deiconify()
+                root.lift()
+            try:
+                root.createcommand("::tk::mac::ReopenApplication", _reopen)
+            except Exception:
+                pass
         root.after(80, self._tick)
 
     def _tick(self):
@@ -713,6 +722,7 @@ class Annotator:
                     lay.raise_()
 
     zwin_shown = False
+    root_hidden = False
 
     def _render(self, z, x0, y0, shapes):
         if z <= 1.001 and (self.LIVE or not shapes):
@@ -734,6 +744,9 @@ class Annotator:
         if self.zwin is not None and self.zwin_shown:
             self.zwin.withdraw()
             self.zwin_shown = False
+            if sys.platform == "darwin":
+                self.refocus = False
+                threading.Thread(target=refocus_ppt, daemon=True).start()
 
     def _snapshot(self):
         """Grab the screen without our own windows on it."""
@@ -790,6 +803,9 @@ class Annotator:
         photo = ImageTk.PhotoImage(compose_view(self.base, (sw, sh), z, x0, y0, shapes))
         self.zlabel.configure(image=photo)
         self.zlabel.image = photo
+        if sys.platform == "darwin" and not self.root_hidden:
+            self.root.withdraw()        # keep the QR window from popping up whenever this app gets focus
+            self.root_hidden = True
         if not self.zwin_shown:
             self.zwin.deiconify()
             self.zwin_shown = True
