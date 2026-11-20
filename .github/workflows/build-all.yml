@@ -122,7 +122,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           grep -vi pywin32 requirements.txt > requirements-mac.txt
-          pip install -r requirements-mac.txt pyobjc-core pyobjc-framework-Quartz pyobjc-framework-Cocoa pyinstaller certifi
+          pip install -r requirements-mac.txt pyobjc-core pyobjc-framework-Quartz pyobjc-framework-Cocoa pyobjc-framework-ApplicationServices pyinstaller certifi
       - name: Apply school logo as the app icon
         run: |
           python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').resize((512,512), Image.LANCZOS).save('icon.icns')"
@@ -146,7 +146,7 @@ jobs:
             --name "GNHS Remote" $ICON \
             --osx-bundle-identifier ph.deped.gnhs.remote \
             --hidden-import desktop_updater --hidden-import certifi \
-            --hidden-import AppKit \
+            --hidden-import AppKit --hidden-import ApplicationServices \
             Remote.py
       - name: Zip the app
         run: |
