@@ -133,6 +133,18 @@ def page(html):
                 .replace("__CAPS__", json.dumps({c: c in CAPS for c, _ in CAP_INFO})))
 
 
+# ------------------------------------------------------------ Mac permission check
+def mac_trusted(prompt=False):
+    """Mac: may this app press keys / move the mouse (Accessibility)? True/False, or None if unknown."""
+    if not MAC:
+        return None
+    try:
+        from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
+        return bool(AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: bool(prompt)}))
+    except Exception:
+        return None
+
+
 # ------------------------------------------------------------ PowerPoint
 def get_app():
     if not w32:
@@ -223,7 +235,8 @@ def act(d):
 
 def status():
     pp = get_app()
-    out = {"com": pp is not None, "running": False, "cur": 0, "total": 0, "notes": "", "state": 1}
+    out = {"com": pp is not None, "running": False, "cur": 0, "total": 0, "notes": "", "state": 1,
+           "trusted": mac_trusted()}
     if pp is None:
         return out
     try:
@@ -879,7 +892,9 @@ $('tools').addEventListener('click',e=>{
 async function poll(){
   try{
     const s=await (await fetch('/status')).json();
-    $('msg').textContent = s.com ? (s.running?'':'Slideshow not running. Press Start.')
+    $('msg').textContent = s.trusted===false
+        ? 'Mac is blocking the remote. On the Mac: System Settings > Privacy & Security > Accessibility: select GNHS Remote, press the minus (-) button, then add it again with + and restart the app.'
+        : s.com ? (s.running?'':'Slideshow not running. Press Start.')
         : 'Keyboard mode (no PowerPoint link): the slideshow window must be in front.';
     $('pos').textContent = s.running ? `${s.cur} / ${s.total}` : (s.total?`– / ${s.total}`:'– / –');
     $('bk').classList.toggle('on',s.state===3); $('wh').classList.toggle('on',s.state===4);
@@ -1721,6 +1736,9 @@ if __name__ == "__main__":
             pass
         sys.exit(1)
 
+    if MAC and mac_trusted(prompt=True) is False:
+        print("  Mac: Accessibility is OFF for this app, so the mouse and keys will not work.\n"
+              "       System Settings > Privacy & Security > Accessibility: remove it with (-), add it again with (+), restart.")
     threading.Thread(target=run_server, daemon=True).start()
     url = f"http://{lan_ip()}:{PORT}"
     mode = "PowerPoint link (COM)" if w32 else "keyboard fallback (PowerPoint link needs pywin32 on Windows)"

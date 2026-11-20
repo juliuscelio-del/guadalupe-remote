@@ -36,3 +36,9 @@ tap Restore to go back to the live slide. Tapping the laptop screen also restore
 Mac: the slide becomes a still picture while marks or zoom are on (tap Restore / Clear all to go
 back to the live slide). The Mac needs Screen Recording and Accessibility permission
 (System Settings > Privacy & Security) for the app, then restart it.
+
+MAC: if the PowerPoint remote or mouse control does nothing
+Open System Settings > Privacy & Security > Accessibility. Select "GNHS Remote", press the minus (-)
+button to remove it, press plus (+) and add it again, then restart the app. Do this after every update
+(the Mac forgets the permission when the app file changes). Screen Recording must also stay ON.
+
