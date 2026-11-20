@@ -24,7 +24,7 @@ Mac permissions (System Settings > Privacy & Security), then restart the script:
   - Accessibility      -> turn on Terminal (needed for mouse and keyboard)
   - Screen Recording   -> turn on Terminal (needed for the live screen view)
 """
-import io, os, re, sys, json, time, socket, secrets, tempfile, threading
+import io, os, re, sys, json, time, socket, secrets, tempfile, threading, subprocess
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
@@ -567,6 +567,7 @@ class Annotator:
         self.hl = self.ink = self.zwin = self.zlabel = None
         self.base = None
         self._n = 0
+        self.refocus = False    # Mac: our window took focus; give it back to PowerPoint before the next key
 
     # ---------- called from the web server threads
     def state(self):
@@ -655,6 +656,16 @@ class Annotator:
                 raise ValueError("unknown action")
             self.dirty = True
             return self._state()
+
+    def settle(self, timeout=1.0):
+        """Wait (max `timeout` s) until the overlay / snapshot window is really gone from the screen."""
+        end = time.time() + timeout
+        while time.time() < end:
+            with self.lock:
+                idle = not self.dirty
+            if idle and not self.zwin_shown:
+                return
+            time.sleep(0.03)
 
     def wipe(self):
         """New slide: drop every mark and zoom back out."""
@@ -786,6 +797,7 @@ class Annotator:
         self.zwin.lift()
         raise_topmost(self.zwin)
         if sys.platform == "darwin":
+            self.refocus = True
             self._mac_float()
         self._hide_layers()
 
@@ -811,6 +823,18 @@ class Annotator:
 
 
 ANN = Annotator()
+
+
+def refocus_ppt():
+    """Mac: bring PowerPoint back to the front so the next key press reaches the slide show, not this app."""
+    if not MAC:
+        return
+    try:
+        subprocess.run(["osascript", "-e", 'tell application "Microsoft PowerPoint" to activate'],
+                       timeout=3, capture_output=True)
+        time.sleep(0.2)
+    except Exception as e:
+        print("could not return to PowerPoint:", e)
 
 
 # ------------------------------------------------------------ web
@@ -1559,11 +1583,15 @@ def api():
         abort(403)
     need("ppt")
     d = request.get_json(force=True)
+    if d.get("a") in NAV_ACTIONS:      # new slide: marks and zoom belong to the old one
+        ANN.wipe()                     # remove them BEFORE pressing the key, so the key reaches the slide show
+        ANN.slide = None
+        ANN.settle()
+    if ANN.refocus and not ANN.zwin_shown:
+        ANN.refocus = False
+        refocus_ppt()
     with LOCK:
         act(d)
-    if d.get("a") in NAV_ACTIONS:      # new slide: marks and zoom belong to the old one
-        ANN.wipe()
-        ANN.slide = None
     return "ok"
 
 
