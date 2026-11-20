@@ -19,7 +19,7 @@ USE THE APP
 6. Tick what the phone may do and tap Continue, then tap Start.
 7. Click Stop when finished. A new PIN is made every time the app starts.
 
-HIGHLIGHT, CIRCLE AND ZOOM (new, Windows)
+HIGHLIGHT, CIRCLE AND ZOOM (new, Windows and Mac)
 1. On the phone's permissions page, tick "Annotate slides" and tap Continue.
    (It shows the laptop screen on the phone so you can point at the text.)
 2. On the main page tap "Highlight - Circle - Zoom".
@@ -33,4 +33,6 @@ HIGHLIGHT, CIRCLE AND ZOOM (new, Windows)
 4. Marks and zoom are cleared automatically when the slide changes.
 Notes: while zoomed, the slide is a still picture (animations and video pause);
 tap Restore to go back to the live slide. Tapping the laptop screen also restores.
-
+Mac: the slide becomes a still picture while marks or zoom are on (tap Restore / Clear all to go
+back to the live slide). The Mac needs Screen Recording and Accessibility permission
+(System Settings > Privacy & Security) for the app, then restart it.

@@ -358,8 +358,9 @@ def dact(d):
 
 # ------------------------------------------------------------ annotations (highlight / circle / zoom)
 # Marks are kept in "screen fractions" (0..1 of the laptop screen), so they survive zooming.
-# At 1x they are shown by two transparent, click-through, always-on-top windows (Windows).
-# When zoomed, a snapshot of the screen is shown full-screen instead, magnified and re-drawn with the marks.
+# Windows: at 1x the marks are shown by two transparent, click-through, always-on-top windows (the slide stays live).
+# Mac (and whenever zoomed): a snapshot of the screen is shown full-screen instead, magnified and re-drawn with
+# the marks. The slide is a still picture while marks/zoom are on; Restore / Clear all go back to the live slide.
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 ZMAX = 6.0
 HL_ALPHA = 0.5          # highlight strength (same at every zoom level)
@@ -482,6 +483,8 @@ class _Layer:
 class Annotator:
     """Highlights and circles drawn over the slide show, plus zoom. Thread-safe state; Tk only on the main thread."""
 
+    LIVE = sys.platform == "win32"      # transparent live overlay (Windows only); otherwise snapshot mode
+
     def __init__(self):
         self.lock = threading.Lock()
         self.shapes = []
@@ -594,8 +597,8 @@ class Annotator:
     # ---------- main (Tk) thread
     def attach(self, root):
         self.root = root
-        if sys.platform != "win32":
-            self.err = "Highlight / circle / zoom works on Windows only for now."
+        if sys.platform not in ("win32", "darwin"):
+            self.err = "Highlight / circle / zoom works on Windows and Mac only."
             print("  Annotate:       " + self.err)
             return
         self.ready = True
@@ -631,10 +634,11 @@ class Annotator:
     zwin_shown = False
 
     def _render(self, z, x0, y0, shapes):
-        if z <= 1.001:
+        if z <= 1.001 and (self.LIVE or not shapes):
             self._hide_zoom()
             self.base = None
-            self._draw_layers(shapes)
+            if self.LIVE:
+                self._draw_layers(shapes)
         else:
             if self.base is None:
                 self._snapshot()
@@ -655,7 +659,7 @@ class Annotator:
         self._hide_layers()
         self._hide_zoom()
         self.root.update()
-        time.sleep(0.15)
+        time.sleep(0.15 if self.LIVE else 0.3)
         with SLOCK:
             self.base = grab_raw()
 
@@ -695,6 +699,7 @@ class Annotator:
             w.overrideredirect(True)
             w.geometry("%dx%d+0+0" % (sw, sh))
             w.configure(bg="black")
+            w.title("GNHS-annotate")
             w.attributes("-topmost", True)
             self.zlabel = tk.Label(w, bd=0, highlightthickness=0, bg="black")
             self.zlabel.place(x=0, y=0, width=sw, height=sh)
@@ -709,7 +714,26 @@ class Annotator:
             self.zwin_shown = True
         self.zwin.attributes("-topmost", True)
         self.zwin.lift()
+        if sys.platform == "darwin":
+            self._mac_float()
         self._hide_layers()
+
+    def _mac_float(self):
+        """Mac: lift our full-screen window above a full-screen PowerPoint show (needs pyobjc)."""
+        try:
+            from AppKit import NSApplication
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            for w in NSApplication.sharedApplication().windows():
+                f = w.frame().size
+                if str(w.title()) == "GNHS-annotate" or (int(f.width) == sw and int(f.height) == sh and w.isVisible()):
+                    w.setLevel_(1000)                       # screen-saver level
+                    w.setCollectionBehavior_((1 << 0) | (1 << 8))   # all spaces + beside full-screen apps
+                    w.orderFrontRegardless()
+                    return
+        except Exception as e:
+            if not getattr(self, "_mac_warned", False):
+                self._mac_warned = True
+                print("annotate: could not raise the window above the slide show:", e)
 
     def _ui_restore(self, _event=None):
         self.handle({"a": "reset"})
